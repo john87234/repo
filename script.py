@@ -5,12 +5,17 @@ import os
 import subprocess
 import ipaddress
 import tempfile
+import threading
+import socketserver
+import http.server
+import urllib.request
+import socket
+import random
 
 # ==========================================
 # 0. SETUP – ensure required packages are installed
 # ==========================================
 def setup():
-    """Install required system and Python packages."""
     if os.geteuid() != 0:
         print("[!] This script must be run as root.")
         sys.exit(1)
@@ -28,7 +33,6 @@ def setup():
         print(f"[!] Setup failed: {e}")
         sys.exit(1)
 
-# Import Masscan after possible installation
 try:
     import masscan
     HAS_MASSCAN_LIB = True
@@ -39,7 +43,7 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"   # e.g. AWS CloudFront / EC2
+CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"
 
 PORT = 443
 TIMEOUT = 1.0
@@ -103,7 +107,7 @@ def run_masscan_scan(ips):
         print("[!] Masscan binary not found.")
         return None, None
 
-    # Write the IP list to a temporary file (required for large lists)
+    # Write target list to temp file
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_targets.txt') as tmp:
             tmp.write('\n'.join(ips))
@@ -118,10 +122,10 @@ def run_masscan_scan(ips):
 
     try:
         mas.scan(hosts='', ports=str(PORT), arguments=f'{MASSCAN_ARGS} -iL {ip_file}')
-        open_hosts = mas.all_hosts         # list of IPs with the port open
+        open_hosts = mas.all_hosts
         open_count = len(open_hosts)
 
-        # Save the open hosts to a separate temp file
+        # Save open hosts to a temp file
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_masscan_results.txt') as res_f:
             res_f.write('\n'.join(open_hosts))
             result_file = res_f.name
@@ -133,7 +137,7 @@ def run_masscan_scan(ips):
         result_file = None
     finally:
         try:
-            os.unlink(ip_file)      # delete the target list
+            os.unlink(ip_file)
         except Exception:
             pass
 
@@ -141,7 +145,96 @@ def run_masscan_scan(ips):
 
 
 # ==========================================
-# 4. MAIN
+# 4. TEMPORARY HTTP SERVER (to share results)
+# ==========================================
+def get_public_ip():
+    """Return the public IP of this machine (or fallback to local IP)."""
+    try:
+        return urllib.request.urlopen('https://api.ipify.org', timeout=5).read().decode().strip()
+    except Exception:
+        # Fallback to local LAN IP (might not be reachable from Windows)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
+        except Exception:
+            return '127.0.0.1'
+        finally:
+            s.close()
+
+def serve_temp_file(file_path, timeout=300):
+    """
+    Start a temporary HTTP server to serve the given file.
+    Prints a public URL and runs for `timeout` seconds (or until Enter is pressed).
+    """
+    # Pick a random high port
+    port = random.randint(8000, 9000)
+    # Make sure the port is free
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('localhost', port)) != 0:
+                break
+            port = random.randint(8000, 9000)
+    else:
+        print("[!] Could not find a free port.")
+        return
+
+    public_ip = get_public_ip()
+    url = f"http://{public_ip}:{port}/results.txt"
+
+    # Minimal HTTP handler that only serves the one file
+    class SingleFileHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/results.txt' or self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                with open(file_path, 'rb') as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_error(404)
+
+    # Use TCPServer to allow address reuse
+    socketserver.TCPServer.allow_reuse_address = True
+    httpd = socketserver.TCPServer(("", port), SingleFileHandler)
+
+    # Run server in a separate thread
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    print("\n" + "=" * 60)
+    print(f" Temporary public link for Masscan results:")
+    print(f"   👉 {url}")
+    print(f" The link will be active for {timeout} seconds.")
+    print(f" Press Enter to stop the server early...")
+    print("=" * 60)
+
+    # Wait for timeout or Enter key
+    try:
+        # Use input() with a timeout via threading
+        stop_event = threading.Event()
+
+        def wait_for_enter():
+            input()
+            stop_event.set()
+
+        input_thread = threading.Thread(target=wait_for_enter, daemon=True)
+        input_thread.start()
+
+        # Wait until timeout or stop_event
+        waited = 0
+        while waited < timeout and not stop_event.is_set():
+            time.sleep(1)
+            waited += 1
+    except KeyboardInterrupt:
+        pass
+
+    httpd.shutdown()
+    print("[*] Temporary server stopped.")
+
+
+# ==========================================
+# 5. MAIN
 # ==========================================
 def main():
     setup()
@@ -173,7 +266,7 @@ def main():
     if masscan_open is not None:
         print("Masscan done.\n")
         if result_file:
-            print(f"You can view the raw results with:  cat {result_file}\n")
+            print(f"You can view the raw results locally:  cat {result_file}\n")
 
     # Summary
     print("=" * 60)
@@ -185,6 +278,11 @@ def main():
     else:
         print(f"{'Stateless (Masscan)':<25} | {'Skipped':<12} | {'N/A':<10}")
     print("=" * 60)
+
+    # Start temporary HTTP server if results exist
+    if result_file and masscan_open:
+        serve_temp_file(result_file, timeout=300)
+
 
 if __name__ == "__main__":
     main()
