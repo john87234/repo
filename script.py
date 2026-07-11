@@ -11,9 +11,10 @@ import http.server
 import urllib.request
 import socket
 import random
+import signal
 
 # ==========================================
-# 0. SETUP – ensure required packages are installed
+# 0. SETUP
 # ==========================================
 def setup():
     if os.geteuid() != 0:
@@ -22,12 +23,12 @@ def setup():
 
     print("[*] Updating package list and installing dependencies...")
     try:
-        subprocess.run(['apt', 'update'], check=True)
+        subprocess.run(['apt', 'update'], check=True, stdout=subprocess.DEVNULL)
         subprocess.run(
             ['apt', 'install', '-y', 'python3-pip', 'python3-dev', 'build-essential', 'masscan'],
-            check=True
+            check=True, stdout=subprocess.DEVNULL
         )
-        subprocess.run(['pip3', 'install', 'scapy', 'python-masscan'], check=True)
+        subprocess.run(['pip3', 'install', 'scapy', 'python-masscan'], check=True, stdout=subprocess.DEVNULL)
         print("[*] All dependencies installed.\n")
     except subprocess.CalledProcessError as e:
         print(f"[!] Setup failed: {e}")
@@ -39,17 +40,14 @@ try:
 except ImportError:
     HAS_MASSCAN_LIB = False
 
-
 # ==========================================
 # CONFIGURATION
 # ==========================================
 CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"
-
 PORT = 443
 TIMEOUT = 1.0
 CONCURRENCY_LIMIT_STATEFUL = 1000
 MASSCAN_ARGS = '--max-rate 50000 --wait 1'
-
 STATEFUL_IP_COUNT = 1_000
 MASSCAN_IP_COUNT  = 100_000
 
@@ -69,7 +67,7 @@ def get_target_ips():
 
 
 # ==========================================
-# 2. STATEFUL SCAN (Async TCP Connect)
+# 2. STATEFUL SCAN
 # ==========================================
 async def stateful_scan_ip(sem, ip):
     async with sem:
@@ -91,7 +89,7 @@ async def run_stateful_scan(ips):
 
 
 # ==========================================
-# 3. STATELESS SCAN (Masscan) – with result file
+# 3. MASSCAN
 # ==========================================
 def run_masscan_scan(ips):
     if not HAS_MASSCAN_LIB:
@@ -107,7 +105,6 @@ def run_masscan_scan(ips):
         print("[!] Masscan binary not found.")
         return None, None
 
-    # Write target list to temp file
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_targets.txt') as tmp:
             tmp.write('\n'.join(ips))
@@ -125,7 +122,6 @@ def run_masscan_scan(ips):
         open_hosts = mas.all_hosts
         open_count = len(open_hosts)
 
-        # Save open hosts to a temp file
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_masscan_results.txt') as res_f:
             res_f.write('\n'.join(open_hosts))
             result_file = res_f.name
@@ -145,14 +141,12 @@ def run_masscan_scan(ips):
 
 
 # ==========================================
-# 4. TEMPORARY HTTP SERVER (to share results)
+# 4. TEMPORARY HTTP SERVER
 # ==========================================
 def get_public_ip():
-    """Return the public IP of this machine (or fallback to local IP)."""
     try:
         return urllib.request.urlopen('https://api.ipify.org', timeout=5).read().decode().strip()
     except Exception:
-        # Fallback to local LAN IP (might not be reachable from Windows)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(('8.8.8.8', 80))
@@ -163,13 +157,8 @@ def get_public_ip():
             s.close()
 
 def serve_temp_file(file_path, timeout=300):
-    """
-    Start a temporary HTTP server to serve the given file.
-    Prints a public URL and runs for `timeout` seconds (or until Enter is pressed).
-    """
-    # Pick a random high port
+    # Pick a random port
     port = random.randint(8000, 9000)
-    # Make sure the port is free
     for _ in range(20):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex(('localhost', port)) != 0:
@@ -182,10 +171,10 @@ def serve_temp_file(file_path, timeout=300):
     public_ip = get_public_ip()
     url = f"http://{public_ip}:{port}/results.txt"
 
-    # Minimal HTTP handler that only serves the one file
+    # HTTP handler
     class SingleFileHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
-            if self.path == '/results.txt' or self.path == '/':
+            if self.path in ('/results.txt', '/'):
                 self.send_response(200)
                 self.send_header('Content-type', 'text/plain')
                 self.end_headers()
@@ -194,43 +183,27 @@ def serve_temp_file(file_path, timeout=300):
             else:
                 self.send_error(404)
 
-    # Use TCPServer to allow address reuse
     socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("", port), SingleFileHandler)
-
-    # Run server in a separate thread
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
     print("\n" + "=" * 60)
-    print(f" Temporary public link for Masscan results:")
+    print(" Temporary public link for Masscan results:")
     print(f"   👉 {url}")
-    print(f" The link will be active for {timeout} seconds.")
-    print(f" Press Enter to stop the server early...")
+    print(f" Server will stay online for {timeout} seconds.")
+    print(" Press Ctrl+C to stop early.")
     print("=" * 60)
 
-    # Wait for timeout or Enter key
+    # Sleep in small intervals to allow KeyboardInterrupt
     try:
-        # Use input() with a timeout via threading
-        stop_event = threading.Event()
-
-        def wait_for_enter():
-            input()
-            stop_event.set()
-
-        input_thread = threading.Thread(target=wait_for_enter, daemon=True)
-        input_thread.start()
-
-        # Wait until timeout or stop_event
-        waited = 0
-        while waited < timeout and not stop_event.is_set():
+        for _ in range(timeout):
             time.sleep(1)
-            waited += 1
     except KeyboardInterrupt:
-        pass
+        print("\n[*] Stopping server early...")
 
     httpd.shutdown()
-    print("[*] Temporary server stopped.")
+    print("[*] Server stopped.")
 
 
 # ==========================================
@@ -251,24 +224,19 @@ def main():
     print(f"\nStateful scan: {len(stateful_ips)} IPs")
     print(f"Masscan: {len(masscan_ips)} IPs\n")
 
-    # Stateful
     print("Running stateful async scan...")
     start = time.time()
     stateful_open = asyncio.run(run_stateful_scan(stateful_ips))
     stateful_time = time.time() - start
     print("Stateful scan done.\n")
 
-    # Masscan
     print("Running Masscan...")
     start = time.time()
     masscan_open, result_file = run_masscan_scan(masscan_ips)
     masscan_time = time.time() - start if masscan_open is not None else None
     if masscan_open is not None:
         print("Masscan done.\n")
-        if result_file:
-            print(f"You can view the raw results locally:  cat {result_file}\n")
 
-    # Summary
     print("=" * 60)
     print(f"{'SCAN TYPE':<25} | {'OPEN PORTS':<12} | {'TIME (s)':<10}")
     print("-" * 60)
@@ -279,7 +247,7 @@ def main():
         print(f"{'Stateless (Masscan)':<25} | {'Skipped':<12} | {'N/A':<10}")
     print("=" * 60)
 
-    # Start temporary HTTP server if results exist
+    # Start the temporary web server if results exist
     if result_file and masscan_open:
         serve_temp_file(result_file, timeout=300)
 
