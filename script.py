@@ -12,7 +12,7 @@ import tempfile
 def setup():
     """Install required system and Python packages."""
     if os.geteuid() != 0:
-        print("[!] This script must be run as root to install packages and run Masscan.")
+        print("[!] This script must be run as root.")
         sys.exit(1)
 
     print("[*] Updating package list and installing dependencies...")
@@ -28,7 +28,7 @@ def setup():
         print(f"[!] Setup failed: {e}")
         sys.exit(1)
 
-# Now import Masscan after installation (it may have just been installed)
+# Import Masscan after possible installation
 try:
     import masscan
     HAS_MASSCAN_LIB = True
@@ -39,11 +39,11 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"   # AWS us-east-1 sample prefix
+CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"   # e.g. AWS CloudFront / EC2
 
 PORT = 443
 TIMEOUT = 1.0
-CONCURRENCY_LIMIT_STATEFUL = 1000     # 1,000 concurrent async connections
+CONCURRENCY_LIMIT_STATEFUL = 1000
 MASSCAN_ARGS = '--max-rate 50000 --wait 1'
 
 STATEFUL_IP_COUNT = 1_000
@@ -51,7 +51,7 @@ MASSCAN_IP_COUNT  = 100_000
 
 
 # ==========================================
-# 1. BUILD IP LIST FROM CLOUD CIDR
+# 1. BUILD IP LIST FROM CIDR
 # ==========================================
 def get_target_ips():
     try:
@@ -60,7 +60,7 @@ def get_target_ips():
         print(f"CIDR {CLOUD_IP_RANGE_CIDR} expanded to {len(ips)} host IPs")
         return ips
     except Exception as e:
-        print(f"Error parsing CIDR {CLOUD_IP_RANGE_CIDR}: {e}")
+        print(f"Error parsing CIDR: {e}")
         sys.exit(1)
 
 
@@ -87,90 +87,95 @@ async def run_stateful_scan(ips):
 
 
 # ==========================================
-# 3. STATELESS SCAN (Masscan via temp file)
+# 3. STATELESS SCAN (Masscan) – with result file
 # ==========================================
 def run_masscan_scan(ips):
     if not HAS_MASSCAN_LIB:
         print("[!] 'python-masscan' not installed. Skipping Masscan.")
-        return None
+        return None, None
     if os.geteuid() != 0:
-        print("[!] Masscan requires root privileges. Skipping...")
-        return None
+        print("[!] Masscan requires root.")
+        return None, None
 
     try:
         mas = masscan.PortScanner()
     except Exception:
-        print("[!] Masscan binary not found. Skipping...")
-        return None
+        print("[!] Masscan binary not found.")
+        return None, None
 
-    # Write IPs to a temporary file and show its path
+    # Write the IP list to a temporary file (required for large lists)
     try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_targets.txt') as tmp:
             tmp.write('\n'.join(ips))
             ip_file = tmp.name
-        print(f"[*] Masscan target list written to: {ip_file}")
+        print(f"[*] Masscan target list: {ip_file}")
     except Exception as e:
-        print(f"[!] Failed to write IP list to temp file: {e}")
-        return None
+        print(f"[!] Failed to write target file: {e}")
+        return None, None
+
+    open_count = 0
+    result_file = None
 
     try:
-        mas.scan(
-            hosts='',
-            ports=str(PORT),
-            arguments=f'{MASSCAN_ARGS} -iL {ip_file}'
-        )
-        open_count = len(mas.all_hosts)
+        mas.scan(hosts='', ports=str(PORT), arguments=f'{MASSCAN_ARGS} -iL {ip_file}')
+        open_hosts = mas.all_hosts         # list of IPs with the port open
+        open_count = len(open_hosts)
+
+        # Save the open hosts to a separate temp file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_masscan_results.txt') as res_f:
+            res_f.write('\n'.join(open_hosts))
+            result_file = res_f.name
+        print(f"[*] Masscan results (open IPs): {result_file}")
+
     except Exception as e:
         print(f"[!] Masscan run failed: {e}")
-        open_count = None
+        open_count = 0
+        result_file = None
     finally:
         try:
-            os.unlink(ip_file)   # clean up
+            os.unlink(ip_file)      # delete the target list
         except Exception:
             pass
 
-    return open_count
+    return open_count, result_file
 
 
 # ==========================================
-# 4. MAIN RUNNER
+# 4. MAIN
 # ==========================================
 def main():
-    # Run setup first (will exit if not root or if install fails)
     setup()
-
     all_ips = get_target_ips()
-    total_available = len(all_ips)
+    total = len(all_ips)
 
-    if total_available < STATEFUL_IP_COUNT:
-        print(f"Only {total_available} IPs available – need {STATEFUL_IP_COUNT} for stateful scan.")
-        sys.exit(1)
-    if total_available < MASSCAN_IP_COUNT:
-        print(f"Only {total_available} IPs available – need {MASSCAN_IP_COUNT} for Masscan.")
+    if total < STATEFUL_IP_COUNT or total < MASSCAN_IP_COUNT:
+        print(f"Not enough IPs. Need at least {max(STATEFUL_IP_COUNT, MASSCAN_IP_COUNT)}.")
         sys.exit(1)
 
     stateful_ips = all_ips[:STATEFUL_IP_COUNT]
     masscan_ips  = all_ips[:MASSCAN_IP_COUNT]
 
-    print(f"\nStateful scan will use {len(stateful_ips)} IPs")
-    print(f"Masscan will use {len(masscan_ips)} IPs\n")
+    print(f"\nStateful scan: {len(stateful_ips)} IPs")
+    print(f"Masscan: {len(masscan_ips)} IPs\n")
 
-    # --- Stateful Scan ---
-    print("Running stateful async TCP connect scan...")
+    # Stateful
+    print("Running stateful async scan...")
     start = time.time()
     stateful_open = asyncio.run(run_stateful_scan(stateful_ips))
     stateful_time = time.time() - start
     print("Stateful scan done.\n")
 
-    # --- Masscan ---
-    print("Running stateless Masscan...")
+    # Masscan
+    print("Running Masscan...")
     start = time.time()
-    masscan_open = run_masscan_scan(masscan_ips)
+    masscan_open, result_file = run_masscan_scan(masscan_ips)
     masscan_time = time.time() - start if masscan_open is not None else None
     if masscan_open is not None:
         print("Masscan done.\n")
+        if result_file:
+            print(f"You can view the raw results with:  cat {result_file}\n")
 
-    # --- Summary ---
+    # Summary
     print("=" * 60)
     print(f"{'SCAN TYPE':<25} | {'OPEN PORTS':<12} | {'TIME (s)':<10}")
     print("-" * 60)
