@@ -3,8 +3,9 @@ import time
 import sys
 import os
 import ipaddress
+import tempfile
 
-# Masscan wrapper (optional but used)
+# Masscan wrapper
 try:
     import masscan
     HAS_MASSCAN_LIB = True
@@ -14,13 +15,12 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Use a large cloud prefix – a /14 contains ~262,142 usable IPs.
-# This ensures we can easily take 100,000 for Masscan and 1,000 for stateful.
-CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"   # AWS us-east-1 region (sample)
+# Large cloud CIDR – a /14 contains ~262k usable IPs, enough for both scans.
+CLOUD_IP_RANGE_CIDR = "52.0.0.0/14"   # AWS us-east-1 sample prefix
 
 PORT = 443
 TIMEOUT = 1.0
-CONCURRENCY_LIMIT_STATEFUL = 1000   # 1,000 concurrent connections
+CONCURRENCY_LIMIT_STATEFUL = 1000     # 1,000 concurrent async connections
 MASSCAN_ARGS = '--max-rate 50000 --wait 1'
 
 # Number of IPs to use for each scan method
@@ -35,7 +35,7 @@ def get_target_ips():
     """Expand the configured CIDR into a list of IP addresses."""
     try:
         network = ipaddress.IPv4Network(CLOUD_IP_RANGE_CIDR, strict=False)
-        # Generate all host addresses (exclude network & broadcast)
+        # Host addresses only (exclude network & broadcast)
         ips = [str(ip) for ip in network.hosts()]
         print(f"CIDR {CLOUD_IP_RANGE_CIDR} expanded to {len(ips)} host IPs")
         return ips
@@ -67,14 +67,14 @@ async def run_stateful_scan(ips):
 
 
 # ==========================================
-# 2. STATELESS SCAN (Masscan)
+# 2. STATELESS SCAN (Masscan via temp file)
 # ==========================================
 def run_masscan_scan(ips):
     if not HAS_MASSCAN_LIB:
         print("[!] 'python-masscan' not installed. Skipping Masscan.")
         return None
     if hasattr(os, 'geteuid') and os.geteuid() != 0:
-        print("[!] Masscan requires root. Skipping...")
+        print("[!] Masscan requires root privileges. Skipping...")
         return None
 
     try:
@@ -83,14 +83,33 @@ def run_masscan_scan(ips):
         print("[!] Masscan binary not found. Skipping...")
         return None
 
+    # Write all IPs to a temporary file to avoid "Argument list too long"
     try:
-        # Masscan accepts comma‑separated IPs or ranges; for large lists we feed them directly
-        ip_str = ",".join(ips)
-        mas.scan(ip_str, ports=str(PORT), arguments=MASSCAN_ARGS)
-        return len(mas.all_hosts)
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+            tmp.write('\n'.join(ips))
+            ip_file = tmp.name
+    except Exception as e:
+        print(f"[!] Failed to write IP list to temp file: {e}")
+        return None
+
+    try:
+        # Use -iL to load targets from file; hosts left empty
+        mas.scan(
+            hosts='',                           # no inline targets
+            ports=str(PORT),
+            arguments=f'{MASSCAN_ARGS} -iL {ip_file}'
+        )
+        open_count = len(mas.all_hosts)
     except Exception as e:
         print(f"[!] Masscan run failed: {e}")
-        return None
+        open_count = None
+    finally:
+        try:
+            os.unlink(ip_file)                  # delete the temporary file
+        except Exception:
+            pass
+
+    return open_count
 
 
 # ==========================================
@@ -100,7 +119,6 @@ def main():
     all_ips = get_target_ips()
     total_available = len(all_ips)
 
-    # Verify we have enough IPs for the requested counts
     if total_available < STATEFUL_IP_COUNT:
         print(f"Only {total_available} IPs available – cannot run {STATEFUL_IP_COUNT} for stateful scan.")
         sys.exit(1)
